@@ -524,6 +524,96 @@ function alignChineseSubtitlesByTime(
 }
 
 /**
+ * 单批文本调用 Google 翻译接口（优先使用 POST 表单提交避免长 URL 被 400/414 拒绝，失败时自动降级备选端点）
+ */
+async function translateBatchText(joinedText: string): Promise<string | null> {
+  const ua =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+  const formBody = new URLSearchParams({ q: joinedText }).toString();
+
+  // 1. 优先通过 POST 请求 translate.googleapis.com (gtx)，无 URL 长度限制且保留换行最稳定
+  try {
+    const gtxPostUrl =
+      "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t";
+    const res = await fetch(gtxPostUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "User-Agent": ua,
+      },
+      body: formBody,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const translatedFull = (data?.[0] || [])
+        .map((seg: [string]) => seg?.[0] || "")
+        .join("");
+      if (translatedFull.trim()) {
+        return translatedFull;
+      }
+    }
+  } catch {
+    // try next endpoint
+  }
+
+  // 2. 备选：通过 POST 请求 clients5.google.com (dict-chrome-ex)
+  try {
+    const clients5PostUrl =
+      "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=zh-CN";
+    const res = await fetch(clients5PostUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "User-Agent": ua,
+      },
+      body: formBody,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const translatedFull =
+        typeof data?.[0] === "string"
+          ? data[0]
+          : Array.isArray(data?.[0])
+          ? data[0][0] || ""
+          : Array.isArray(data?.sentences)
+          ? data.sentences.map((s: { trans?: string }) => s?.trans || "").join("")
+          : "";
+      if (String(translatedFull).trim()) {
+        return String(translatedFull);
+      }
+    }
+  } catch {
+    // try next endpoint
+  }
+
+  // 3. 兜底：通过 GET 请求 translate.googleapis.com（适用于短批次）
+  try {
+    const gtxGetUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(
+      joinedText
+    )}`;
+    const res = await fetch(gtxGetUrl, {
+      headers: { "User-Agent": ua },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const translatedFull = (data?.[0] || [])
+        .map((seg: [string]) => seg?.[0] || "")
+        .join("");
+      if (translatedFull.trim()) {
+        return translatedFull;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+/**
  * 将非中文字幕并发分批翻译为中文
  */
 async function translateSubtitlesToChinese(
@@ -538,10 +628,29 @@ async function translateSubtitlesToChinese(
     return result;
   }
 
-  const BATCH_SIZE = 60;
+  // 同时按句数（最多 35 句）与字符数（最多 2200 字符）动态分批，兼顾 Cloudflare 子请求数上限与单次翻译体积
+  const MAX_ITEMS_PER_BATCH = 35;
+  const MAX_CHARS_PER_BATCH = 2200;
   const batches: number[][] = [];
-  for (let i = 0; i < untranslatedIndices.length; i += BATCH_SIZE) {
-    batches.push(untranslatedIndices.slice(i, i + BATCH_SIZE));
+  let currentBatch: number[] = [];
+  let currentChars = 0;
+
+  for (const idx of untranslatedIndices) {
+    const lineLen = result[idx].text.length + 1;
+    if (
+      currentBatch.length > 0 &&
+      (currentBatch.length >= MAX_ITEMS_PER_BATCH ||
+        currentChars + lineLen > MAX_CHARS_PER_BATCH)
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentChars = 0;
+    }
+    currentBatch.push(idx);
+    currentChars += lineLen;
+  }
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
   }
 
   // 控制并发数为 5，加速长视频字幕翻译
@@ -551,64 +660,19 @@ async function translateSubtitlesToChinese(
     await Promise.all(
       chunk.map(async (indices) => {
         const joinedText = indices
-          .map((idx) => result[idx].text.replace(/\n/g, " "))
+          .map((idx) => result[idx].text.replace(/[\r\n]+/g, " ").trim() || ".")
           .join("\n");
 
-        try {
-          // 优先使用 clients5.google.com (dict-chrome-ex)，不易触发代理 IP 的 429 限制
-          const clients5Url = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=zh-CN&q=${encodeURIComponent(
-            joinedText
-          )}`;
-          const res = await fetch(clients5Url, {
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            },
-            signal: AbortSignal.timeout(8000),
-          });
-          if (res.ok) {
-            const data = await res.json();
-            const translatedFull =
-              typeof data?.[0] === "string"
-                ? data[0]
-                : Array.isArray(data?.[0])
-                ? data[0][0] || ""
-                : "";
-            const lines = String(translatedFull).split("\n");
+        const translatedFull = await translateBatchText(joinedText);
+        if (!translatedFull) return;
 
-            indices.forEach((targetIdx, lineIdx) => {
-              const trans = (lines[lineIdx] || "").trim();
-              if (trans) {
-                result[targetIdx].translation = trans;
-              }
-            });
-            return;
+        const lines = translatedFull.split(/\r?\n/);
+        indices.forEach((targetIdx, lineIdx) => {
+          const trans = (lines[lineIdx] || "").trim();
+          if (trans) {
+            result[targetIdx].translation = trans;
           }
-
-          // 备用：translate.googleapis.com
-          const gtxUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(
-            joinedText
-          )}`;
-          const gtxRes = await fetch(gtxUrl, {
-            signal: AbortSignal.timeout(8000),
-          });
-          if (gtxRes.ok) {
-            const data = await gtxRes.json();
-            const translatedFull = (data?.[0] || [])
-              .map((seg: [string]) => seg?.[0] || "")
-              .join("");
-            const lines = translatedFull.split("\n");
-
-            indices.forEach((targetIdx, lineIdx) => {
-              const trans = (lines[lineIdx] || "").trim();
-              if (trans) {
-                result[targetIdx].translation = trans;
-              }
-            });
-          }
-        } catch {
-          // 单批失败不阻塞整体
-        }
+        });
       })
     );
   }
@@ -676,7 +740,7 @@ export async function getOrParseVideoData(
 
   // 6. 如果视频本身不是中文，则需要翻译为中文（同时显示原字幕及其中文翻译）
   if (!isChinese) {
-    // 优先查找视频是否已有官方中文字幕轨道（严格按 zh-cn / zh-hans -> zh -> 其他中文 优先级）
+    // 6.1 优先查找视频是否已有官方中文字幕轨道（严格按 zh-cn / zh-hans -> zh -> 其他中文 优先级）
     const existingZhTrack =
       tracks.find((t) => {
         const c = t.languageCode.toLowerCase();
@@ -695,7 +759,31 @@ export async function getOrParseVideoData(
       }
     }
 
-    // 对未匹配到中文翻译的句子，调用并发批量翻译补齐
+    // 6.2 若无现成人工中文字幕，尝试请求 YouTube 原生自动翻译轨道 (&tlang=zh-Hans)，仅需 1 次请求即可对齐全片
+    const hasTranslatedCount = finalSubtitles.filter((s) => Boolean(s.translation)).length;
+    if (
+      hasTranslatedCount < finalSubtitles.length * 0.5 &&
+      primaryTrack.isTranslatable !== false
+    ) {
+      const autoZhUrl = primaryTrack.baseUrl.includes("tlang=")
+        ? primaryTrack.baseUrl.replace(/tlang=[^&]+/, "tlang=zh-Hans")
+        : `${primaryTrack.baseUrl}&tlang=zh-Hans`;
+      const autoZhSubs = await downloadTrackSubtitles(autoZhUrl, {
+        cookie: captionData.cookie,
+        userAgent: captionData.userAgent,
+      });
+      if (autoZhSubs.length > 0) {
+        const autoZhSample = autoZhSubs
+          .slice(0, 12)
+          .map((s) => s.text)
+          .join(" ");
+        if (isTextMostlyChinese(autoZhSample)) {
+          finalSubtitles = alignChineseSubtitlesByTime(finalSubtitles, autoZhSubs);
+        }
+      }
+    }
+
+    // 6.3 对仍未匹配到中文翻译的句子，调用并发 POST 批量翻译补齐
     finalSubtitles = await translateSubtitlesToChinese(finalSubtitles);
   }
 
