@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { lookupWord } from "@/lib/dict";
 
+export const runtime = "edge";
+
 export async function GET(req: NextRequest) {
   const word = req.nextUrl.searchParams.get("word") || "";
   if (!word.trim()) {

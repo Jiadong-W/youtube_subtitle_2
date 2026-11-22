@@ -1,7 +1,5 @@
 import { SubtitleItem, VideoLearningData } from "@/types";
 import { PRESET_VIDEOS } from "./presetVideos";
-import fs from "fs";
-import path from "path";
 
 /**
  * 从各种格式的 YouTube 链接中提取 11 位 videoId
@@ -76,15 +74,9 @@ export function isTextMostlyChinese(text: string): boolean {
 }
 
 /**
- * 获取本地文件缓存路径
+ * 内存级视频字幕缓存（适配 Cloudflare Edge / Workers 无本地文件系统环境）
  */
-function getCacheFilePath(videoId: string): string {
-  const cacheDir = path.join(process.cwd(), ".cache", "videos");
-  if (!fs.existsSync(cacheDir)) {
-    fs.mkdirSync(cacheDir, { recursive: true });
-  }
-  return path.join(cacheDir, `${videoId}.json`);
-}
+const VIDEO_MEMORY_CACHE = new Map<string, VideoLearningData>();
 
 /**
  * 通过 YouTube oEmbed 获取原视频标题与真实宽高比
@@ -546,7 +538,7 @@ async function translateSubtitlesToChinese(
     return result;
   }
 
-  const BATCH_SIZE = 30;
+  const BATCH_SIZE = 60;
   const batches: number[][] = [];
   for (let i = 0; i < untranslatedIndices.length; i += BATCH_SIZE) {
     batches.push(untranslatedIndices.slice(i, i + BATCH_SIZE));
@@ -635,37 +627,17 @@ export async function getOrParseVideoData(
     return PRESET_VIDEOS[videoId];
   }
 
-  // 2. 检查本地文件缓存
-  const cacheFile = getCacheFilePath(videoId);
-  if (fs.existsSync(cacheFile)) {
-    try {
-      const cached: VideoLearningData = JSON.parse(
-        fs.readFileSync(cacheFile, "utf-8")
-      );
-      if (cached && cached.subtitles?.length > 0) {
-        // 如果之前缓存的非中文视频存在漏翻句子，自动补齐翻译并更新缓存
-        const hasMissingTranslation =
-          !cached.isChineseOriginal &&
-          cached.subtitles.some((s) => !s.translation);
-        if (hasMissingTranslation) {
-          cached.subtitles = await translateSubtitlesToChinese(
-            cached.subtitles
-          );
-          try {
-            fs.writeFileSync(
-              cacheFile,
-              JSON.stringify(cached, null, 2),
-              "utf-8"
-            );
-          } catch {
-            // ignore
-          }
-        }
-        return cached;
-      }
-    } catch {
-      // ignore corrupted cache
+  // 2. 检查内存缓存
+  const cached = VIDEO_MEMORY_CACHE.get(videoId);
+  if (cached && cached.subtitles?.length > 0) {
+    const hasMissingTranslation =
+      !cached.isChineseOriginal &&
+      cached.subtitles.some((s) => !s.translation);
+    if (hasMissingTranslation) {
+      cached.subtitles = await translateSubtitlesToChinese(cached.subtitles);
+      VIDEO_MEMORY_CACHE.set(videoId, cached);
     }
+    return cached;
   }
 
   // 3. 并行请求 oEmbed 元信息与字幕轨道列表
@@ -736,12 +708,8 @@ export async function getOrParseVideoData(
     subtitles: finalSubtitles,
   };
 
-  // 写入服务端缓存
-  try {
-    fs.writeFileSync(cacheFile, JSON.stringify(result, null, 2), "utf-8");
-  } catch {
-    // ignore write error
-  }
+  // 写入内存缓存
+  VIDEO_MEMORY_CACHE.set(videoId, result);
 
   return result;
 }
