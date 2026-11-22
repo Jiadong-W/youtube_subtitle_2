@@ -76,6 +76,16 @@ export default function HomePage() {
         updatedAt: Date.now(),
       });
 
+      // 将首次解析成功的完整视频与字幕数据存入 sessionStorage，进入学习页时直接秒开复用，避免 1 秒内二次重复请求
+      try {
+        sessionStorage.setItem(
+          `yt_learn_video_data_${data.videoId}`,
+          JSON.stringify(data)
+        );
+      } catch {
+        // ignore storage quota error
+      }
+
       router.push(`/learn/${data.videoId}`);
     } catch {
       setErrorMsg("该视频暂无可用字幕，请更换视频");

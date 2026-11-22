@@ -74,9 +74,73 @@ export function isTextMostlyChinese(text: string): boolean {
 }
 
 /**
- * 内存级视频字幕缓存（适配 Cloudflare Edge / Workers 无本地文件系统环境）
+ * 内存级视频字幕缓存 + Cloudflare 边缘机房级共享 Cache API (`caches.default`)
  */
 const VIDEO_MEMORY_CACHE = new Map<string, VideoLearningData>();
+const EDGE_CACHE_KEY_PREFIX = "https://edge-cache.echotube.internal/video/v2/";
+
+async function getEdgeCachedVideo(
+  videoId: string
+): Promise<VideoLearningData | null> {
+  const mem = VIDEO_MEMORY_CACHE.get(videoId);
+  if (mem && mem.subtitles?.length > 0) {
+    return mem;
+  }
+
+  try {
+    const cacheStorage = (
+      globalThis as unknown as {
+        caches?: { default?: Cache };
+      }
+    ).caches?.default;
+    if (!cacheStorage) return null;
+
+    const cacheReq = new Request(
+      `${EDGE_CACHE_KEY_PREFIX}${encodeURIComponent(videoId)}`
+    );
+    const res = await cacheStorage.match(cacheReq);
+    if (res && res.ok) {
+      const data = (await res.json()) as VideoLearningData;
+      if (data && data.subtitles?.length > 0) {
+        VIDEO_MEMORY_CACHE.set(videoId, data);
+        return data;
+      }
+    }
+  } catch {
+    // ignore edge cache read error
+  }
+
+  return null;
+}
+
+async function setEdgeCachedVideo(
+  videoId: string,
+  data: VideoLearningData
+): Promise<void> {
+  VIDEO_MEMORY_CACHE.set(videoId, data);
+
+  try {
+    const cacheStorage = (
+      globalThis as unknown as {
+        caches?: { default?: Cache };
+      }
+    ).caches?.default;
+    if (!cacheStorage) return;
+
+    const cacheReq = new Request(
+      `${EDGE_CACHE_KEY_PREFIX}${encodeURIComponent(videoId)}`
+    );
+    const cacheRes = new Response(JSON.stringify(data), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=86400",
+      },
+    });
+    await cacheStorage.put(cacheReq, cacheRes);
+  } catch {
+    // ignore edge cache write error
+  }
+}
 
 /**
  * 通过 YouTube oEmbed 获取原视频标题与真实宽高比
@@ -118,6 +182,92 @@ interface CaptionTrackInfo {
 interface YouTubeSession {
   cookie: string;
   visitorData: string;
+  htmlTracks?: CaptionTrackInfo[];
+  htmlTitle?: string;
+  htmlAspectRatio?: number;
+}
+
+/**
+ * 从 YouTube watch 网页 HTML 中直接提取 ytInitialPlayerResponse 里的字幕轨道与视频信息
+ */
+function extractPlayerDataFromWatchHtml(html: string): {
+  tracks: CaptionTrackInfo[];
+  title?: string;
+  aspectRatio?: number;
+} {
+  try {
+    const marker = "var ytInitialPlayerResponse = ";
+    let startIdx = html.indexOf(marker);
+    let offset = marker.length;
+    if (startIdx === -1) {
+      const altMarker = "ytInitialPlayerResponse = ";
+      startIdx = html.indexOf(altMarker);
+      offset = altMarker.length;
+    }
+
+    if (startIdx !== -1) {
+      const jsonStart = html.indexOf("{", startIdx + offset);
+      if (jsonStart !== -1) {
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        let jsonEnd = -1;
+
+        for (let i = jsonStart; i < html.length; i++) {
+          const ch = html[i];
+          if (escape) {
+            escape = false;
+            continue;
+          }
+          if (ch === "\\") {
+            escape = true;
+            continue;
+          }
+          if (ch === '"') {
+            inString = !inString;
+            continue;
+          }
+          if (!inString) {
+            if (ch === "{") depth++;
+            else if (ch === "}") {
+              depth--;
+              if (depth === 0) {
+                jsonEnd = i + 1;
+                break;
+              }
+            }
+          }
+        }
+
+        if (jsonEnd !== -1) {
+          const data = JSON.parse(html.slice(jsonStart, jsonEnd));
+          const tracks: CaptionTrackInfo[] =
+            data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+            [];
+          const title = data?.videoDetails?.title;
+          const formats = data?.streamingData?.adaptiveFormats || [];
+          const videoFormat = formats.find(
+            (f: { width?: number; height?: number }) => f.width && f.height
+          );
+          const aspectRatio =
+            videoFormat?.width && videoFormat?.height
+              ? videoFormat.width / videoFormat.height
+              : undefined;
+          return { tracks, title, aspectRatio };
+        }
+      }
+    }
+
+    // 备选正则：直接提取 "captionTracks":[...] 数组
+    const tracksMatch = html.match(/"captionTracks"\s*:\s*(\[[\s\S]*?\])\s*,\s*"audioTracks"/);
+    if (tracksMatch?.[1]) {
+      const tracks = JSON.parse(tracksMatch[1]) as CaptionTrackInfo[];
+      return { tracks };
+    }
+  } catch {
+    // ignore html parse error
+  }
+  return { tracks: [] };
 }
 
 const INNERTUBE_CLIENTS = [
@@ -226,26 +376,51 @@ async function fetchYouTubeSession(videoId: string): Promise<YouTubeSession> {
     const html = await pageRes.text();
     const visitorData =
       html.match(/"VISITOR_DATA"\s*:\s*"([^"]+)"/)?.[1] || "";
+    const htmlParsed = extractPlayerDataFromWatchHtml(html);
 
-    return { cookie, visitorData };
+    return {
+      cookie,
+      visitorData,
+      htmlTracks: htmlParsed.tracks,
+      htmlTitle: htmlParsed.title,
+      htmlAspectRatio: htmlParsed.aspectRatio,
+    };
   } catch {
     return { cookie: "SOCS=CAI; PREF=hl=en&tz=UTC", visitorData: "" };
   }
 }
 
 /**
- * 通过多客户端轮询提取字幕轨道列表
+ * 通过多客户端轮询提取字幕轨道列表（同时支持 watch 网页 HTML 内嵌轨道兜底）
  */
 async function fetchCaptionTracks(videoId: string): Promise<{
   title?: string;
   aspectRatio?: number;
   tracks: CaptionTrackInfo[];
+  fallbackTracks?: CaptionTrackInfo[];
   cookie: string;
   userAgent: string;
 }> {
+  const webUa =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+  let lastHtmlFallback: {
+    tracks: CaptionTrackInfo[];
+    title?: string;
+    aspectRatio?: number;
+    cookie: string;
+  } | null = null;
+
   // 最多尝试 2 轮会话（如果第 1 个 visitorData 会话偶然被风控，刷新一次会话重试）
   for (let attempt = 0; attempt < 2; attempt++) {
     const session = await fetchYouTubeSession(videoId);
+    if (session.htmlTracks && session.htmlTracks.length > 0) {
+      lastHtmlFallback = {
+        tracks: session.htmlTracks,
+        title: session.htmlTitle,
+        aspectRatio: session.htmlAspectRatio,
+        cookie: session.cookie,
+      };
+    }
 
     for (const c of INNERTUBE_CLIENTS) {
       try {
@@ -284,12 +459,12 @@ async function fetchCaptionTracks(videoId: string): Promise<{
         if (!res.ok) continue;
         const data = await res.json();
         const status = data?.playabilityStatus?.status;
+        const tracks: CaptionTrackInfo[] =
+          data?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
 
-        if (status === "OK") {
-          const tracks: CaptionTrackInfo[] =
-            data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
-            [];
-          const title = data?.videoDetails?.title;
+        // 必须确保不仅 status === "OK"，而且确实拿到了非空的 captionTracks，否则继续尝试下一个客户端
+        if (status === "OK" && tracks.length > 0) {
+          const title = data?.videoDetails?.title || session.htmlTitle;
           const formats = data?.streamingData?.adaptiveFormats || [];
           const videoFormat = formats.find(
             (f: { width?: number; height?: number }) => f.width && f.height
@@ -297,12 +472,13 @@ async function fetchCaptionTracks(videoId: string): Promise<{
           const aspectRatio =
             videoFormat?.width && videoFormat?.height
               ? videoFormat.width / videoFormat.height
-              : undefined;
+              : session.htmlAspectRatio;
 
           return {
             title,
             aspectRatio,
             tracks,
+            fallbackTracks: session.htmlTracks,
             cookie: session.cookie,
             userAgent: c.ua,
           };
@@ -310,6 +486,17 @@ async function fetchCaptionTracks(videoId: string): Promise<{
       } catch {
         // try next client
       }
+    }
+
+    // 如果当前轮次所有 Innertube 客户端被风控，但 watch 网页 HTML 中已直接提取到字幕轨道，则直接使用
+    if (lastHtmlFallback && lastHtmlFallback.tracks.length > 0) {
+      return {
+        title: lastHtmlFallback.title,
+        aspectRatio: lastHtmlFallback.aspectRatio,
+        tracks: lastHtmlFallback.tracks,
+        cookie: lastHtmlFallback.cookie,
+        userAgent: webUa,
+      };
     }
   }
 
@@ -691,15 +878,15 @@ export async function getOrParseVideoData(
     return PRESET_VIDEOS[videoId];
   }
 
-  // 2. 检查内存缓存
-  const cached = VIDEO_MEMORY_CACHE.get(videoId);
+  // 2. 检查内存缓存与 Cloudflare 边缘共享缓存 (caches.default)
+  const cached = await getEdgeCachedVideo(videoId);
   if (cached && cached.subtitles?.length > 0) {
     const hasMissingTranslation =
       !cached.isChineseOriginal &&
       cached.subtitles.some((s) => !s.translation);
     if (hasMissingTranslation) {
       cached.subtitles = await translateSubtitlesToChinese(cached.subtitles);
-      VIDEO_MEMORY_CACHE.set(videoId, cached);
+      await setEdgeCachedVideo(videoId, cached);
     }
     return cached;
   }
@@ -710,19 +897,33 @@ export async function getOrParseVideoData(
     fetchCaptionTracks(videoId),
   ]);
 
-  const tracks = captionData.tracks;
+  let tracks = captionData.tracks;
   if (!tracks || tracks.length === 0) {
     throw new Error("NO_SUBTITLES");
   }
 
   // 4. 智能选择视频原声主字幕轨道
-  const primaryTrack = selectPrimaryTrack(tracks);
-  const langCode = primaryTrack.languageCode || "en";
+  let primaryTrack = selectPrimaryTrack(tracks);
+  let langCode = primaryTrack.languageCode || "en";
 
-  const subtitles = await downloadTrackSubtitles(primaryTrack.baseUrl, {
+  let subtitles = await downloadTrackSubtitles(primaryTrack.baseUrl, {
     cookie: captionData.cookie,
     userAgent: captionData.userAgent,
   });
+
+  // 如果首选客户端返回的字幕轨道下载为空，且存在 watch 网页 HTML 提取到的备用轨道，则自动用备用轨道重试
+  if (
+    (!subtitles || subtitles.length === 0) &&
+    captionData.fallbackTracks &&
+    captionData.fallbackTracks.length > 0
+  ) {
+    tracks = captionData.fallbackTracks;
+    primaryTrack = selectPrimaryTrack(tracks);
+    langCode = primaryTrack.languageCode || "en";
+    subtitles = await downloadTrackSubtitles(primaryTrack.baseUrl, {
+      cookie: captionData.cookie,
+    });
+  }
 
   if (!subtitles || subtitles.length === 0) {
     throw new Error("NO_SUBTITLES");
@@ -796,8 +997,8 @@ export async function getOrParseVideoData(
     subtitles: finalSubtitles,
   };
 
-  // 写入内存缓存
-  VIDEO_MEMORY_CACHE.set(videoId, result);
+  // 写入内存缓存与 Cloudflare 边缘共享缓存
+  await setEdgeCachedVideo(videoId, result);
 
   return result;
 }

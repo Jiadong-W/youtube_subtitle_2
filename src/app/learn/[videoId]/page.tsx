@@ -49,12 +49,41 @@ function LearnVideoContent() {
     loopSingleRef.current = loopSingle;
   }, [loopSingle]);
 
-  // 加载视频与字幕数据
+  // 加载视频与字幕数据（优先复用首页刚刚解析好的 sessionStorage 缓存，避免跳转到不同 Worker 实例触发二次抓取）
   useEffect(() => {
     if (!videoId) return;
     let cancelled = false;
     setLoading(true);
     setErrorMsg(null);
+
+    const applyLoadedData = (data: VideoLearningData) => {
+      setVideoData(data);
+      if (initialTimeParam > 0 && data.subtitles?.length > 0) {
+        const foundIdx = data.subtitles.findIndex(
+          (s: SubtitleItem) =>
+            initialTimeParam >= s.start && initialTimeParam <= s.end
+        );
+        if (foundIdx !== -1) {
+          setActiveIndex(foundIdx);
+        }
+      }
+      setLoading(false);
+    };
+
+    try {
+      const cachedRaw = sessionStorage.getItem(
+        `yt_learn_video_data_${videoId}`
+      );
+      if (cachedRaw) {
+        const cachedData = JSON.parse(cachedRaw) as VideoLearningData;
+        if (cachedData && cachedData.subtitles?.length > 0) {
+          applyLoadedData(cachedData);
+          return;
+        }
+      }
+    } catch {
+      // ignore sessionStorage read error
+    }
 
     fetch(`/api/video/parse?videoId=${encodeURIComponent(videoId)}`)
       .then(async (res) => {
@@ -63,18 +92,15 @@ function LearnVideoContent() {
           throw new Error(data?.message || "该视频暂无可用字幕，请更换视频");
         }
         if (!cancelled) {
-          setVideoData(data);
-          // 如果 URL 带有初始时间戳参数（例如 ?t=741 对应 Don't be trapped by dogma），定位到对应句子
-          if (initialTimeParam > 0 && data.subtitles?.length > 0) {
-            const foundIdx = data.subtitles.findIndex(
-              (s: SubtitleItem) =>
-                initialTimeParam >= s.start && initialTimeParam <= s.end
+          try {
+            sessionStorage.setItem(
+              `yt_learn_video_data_${videoId}`,
+              JSON.stringify(data)
             );
-            if (foundIdx !== -1) {
-              setActiveIndex(foundIdx);
-            }
+          } catch {
+            // ignore
           }
-          setLoading(false);
+          applyLoadedData(data);
         }
       })
       .catch((err: unknown) => {
