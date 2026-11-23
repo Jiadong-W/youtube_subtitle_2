@@ -230,10 +230,10 @@ function LearnVideoContent() {
   const currentSubtitle = videoData.subtitles[activeIndex] || null;
 
   return (
-    <div className="h-screen flex flex-col bg-paper-bg overflow-hidden">
+    <div className="h-[100dvh] lg:h-screen flex flex-col bg-paper-bg overflow-hidden">
       {/* 顶部导航栏（完全对齐 example.jpg 顶部样式） */}
-      <header className="h-12 px-4 bg-[#FDFCF9] border-b border-paper-border flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
+      <header className="h-11 lg:h-12 px-3 lg:px-4 bg-[#FDFCF9] border-b border-paper-border flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-1.5 lg:gap-2 min-w-0">
           <button
             type="button"
             onClick={() => router.push("/")}
@@ -247,17 +247,17 @@ function LearnVideoContent() {
           </h1>
         </div>
 
-        <div className="flex items-center gap-3 text-xs text-stone-400 shrink-0">
+        <div className="flex items-center gap-3 text-xs text-stone-400 shrink-0 pl-2">
           <span>
             {videoData.isChineseOriginal ? "中文原声视频" : "英文/外语双语对照"}
           </span>
         </div>
       </header>
 
-      {/* 主体双栏区域（左侧：原比例视频 + 左下角当前句与点词翻译；右侧：字幕列表 + 底部播控） */}
-      <div className="flex-1 flex flex-col lg:flex-row min-h-0 p-3 md:p-4 gap-4">
-        {/* 左侧栏 */}
-        <div className="flex-1 lg:w-[62%] flex flex-col gap-3 min-h-0">
+      {/* 主体双栏区域（移动端上中下紧凑排布不挤压视频；桌面端左右双栏） */}
+      <div className="flex-1 flex flex-col lg:flex-row min-h-0 p-2.5 md:p-4 gap-2.5 md:gap-4 overflow-y-auto lg:overflow-hidden">
+        {/* 左侧栏（移动端为上半部分，shrink-0 防止被下方字幕列表挤压） */}
+        <div className="shrink-0 lg:shrink lg:flex-1 lg:w-[62%] flex flex-col gap-2.5 md:gap-3 lg:min-h-0">
           {/* 左侧上方：保持原视频长宽比的视频播放区 */}
           <YouTubePlayer
             ref={playerRef}
@@ -277,7 +277,7 @@ function LearnVideoContent() {
         </div>
 
         {/* 右侧栏：原视频字幕与翻译列表 + 播控条 */}
-        <div className="lg:w-[38%] xl:w-[36%] h-[45vh] lg:h-full bg-[#F8F6F0] rounded-xl border border-paper-border flex flex-col min-h-0 overflow-hidden shadow-2xs">
+        <div className="flex-1 min-h-[260px] lg:w-[38%] xl:w-[36%] lg:h-full bg-[#F8F6F0] rounded-xl border border-paper-border flex flex-col overflow-hidden shadow-2xs">
           <SubtitleList
             subtitles={videoData.subtitles}
             activeIndex={activeIndex}

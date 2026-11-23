@@ -119,8 +119,8 @@ export default function CurrentSubtitleCard({
 
   if (!subtitle) {
     return (
-      <div className="flex-1 bg-[#F5F2EA] rounded-xl border border-paper-border flex flex-col items-center justify-center p-6 text-stone-400">
-        <p className="text-base">播放视频或点击右侧字幕以显示当前句子</p>
+      <div className="shrink-0 lg:flex-1 bg-[#F5F2EA] rounded-xl border border-paper-border flex flex-col items-center justify-center p-4 lg:p-6 min-h-[110px] lg:min-h-[210px] text-stone-400">
+        <p className="text-sm lg:text-base">播放视频或点击右侧字幕以显示当前句子</p>
       </div>
     );
   }
@@ -128,15 +128,15 @@ export default function CurrentSubtitleCard({
   const tokens = tokenizeSentence(subtitle.text);
 
   return (
-    <div className="flex-1 bg-[#F5F2EA] rounded-xl border border-paper-border flex flex-col items-center justify-center px-8 py-6 relative min-h-[210px] transition-all">
+    <div className="shrink-0 lg:flex-1 bg-[#F5F2EA] rounded-xl border border-paper-border flex flex-col items-center justify-center px-4 py-3.5 lg:px-8 lg:py-6 relative min-h-[110px] lg:min-h-[210px] transition-all">
       {/* 当前句原文：英文单词支持独立点击 */}
       <div className="text-center max-w-3xl leading-relaxed">
         {isChineseOriginal ? (
-          <p className="text-2xl md:text-[26px] font-medium text-stone-800 tracking-wide">
+          <p className="text-lg sm:text-xl lg:text-[26px] font-medium text-stone-800 tracking-wide">
             {subtitle.text}
           </p>
         ) : (
-          <p className="font-serif text-2xl md:text-[28px] text-stone-900 leading-snug select-none">
+          <p className="font-serif text-lg sm:text-xl lg:text-[28px] text-stone-900 leading-snug select-none">
             {tokens.map((token, idx) => {
               if (!token.isWord) {
                 return <span key={idx}>{token.text}</span>;
@@ -162,7 +162,7 @@ export default function CurrentSubtitleCard({
 
         {/* 中文翻译（仅当视频本身非中文且开启双语时显示） */}
         {!isChineseOriginal && showTranslation && subtitle.translation && (
-          <p className="mt-3 text-base md:text-lg text-stone-600 font-normal">
+          <p className="mt-1.5 lg:mt-3 text-sm sm:text-base lg:text-lg text-stone-600 font-normal">
             {subtitle.translation}
           </p>
         )}
@@ -170,7 +170,7 @@ export default function CurrentSubtitleCard({
 
       {/* 底部区域：弹出单词翻译卡片（参考 certain_word.jpg）或句子序号时间戳 */}
       {loadingWord || wordResult ? (
-        <div className="mt-5 w-full max-w-xl bg-white rounded-xl shadow-sm border border-[#E6E2D8] px-5 py-3 flex items-center justify-between gap-4 animate-in fade-in duration-150">
+        <div className="mt-3 lg:mt-5 w-full max-w-xl bg-white rounded-xl shadow-sm border border-[#E6E2D8] px-3.5 py-2.5 lg:px-5 lg:py-3 flex items-center justify-between gap-3 lg:gap-4 animate-in fade-in duration-150">
           {loadingWord ? (
             <div className="flex items-center gap-2 text-stone-500 text-sm py-0.5">
               <Loader2 className="w-4 h-4 animate-spin" />
