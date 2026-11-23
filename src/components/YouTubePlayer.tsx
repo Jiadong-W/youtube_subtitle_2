@@ -64,7 +64,10 @@ interface YTPlayerInstance {
 }
 
 const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>(
-  ({ videoId, aspectRatio, initialTime = 0, onTimeUpdate, onPlayStateChange }, ref) => {
+  (
+    { videoId, aspectRatio, initialTime = 0, onTimeUpdate, onPlayStateChange },
+    ref
+  ) => {
     const mountRef = useRef<HTMLDivElement | null>(null);
     const playerRef = useRef<YTPlayerInstance | null>(null);
     const isReadyRef = useRef(false);
@@ -206,16 +209,16 @@ const YouTubePlayer = forwardRef<YouTubePlayerHandle, YouTubePlayerProps>(
           }
         }
       };
-    }, [videoId]);
+    }, [videoId, initialTime]);
 
-    // 保持原视频长宽比不变：外层为黑色剧院框，内层严格锁定原视频 aspectRatio
+    // 保持原视频长宽比不变：添加 shrink-0 防止移动端纵向 Flex 挤压视频高度
     const safeRatio =
       aspectRatio && Number.isFinite(aspectRatio) && aspectRatio > 0
         ? aspectRatio
         : 16 / 9;
 
     return (
-      <div className="w-full bg-black rounded-lg overflow-hidden flex items-center justify-center relative shadow-sm">
+      <div className="w-full shrink-0 bg-black rounded-lg overflow-hidden flex items-center justify-center relative shadow-sm">
         <div
           className="w-full max-h-[58vh] flex items-center justify-center mx-auto relative"
           style={{ aspectRatio: "16 / 9" }}
