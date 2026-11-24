@@ -1,5 +1,6 @@
 import { SubtitleItem, VideoLearningData } from "@/types";
 import { PRESET_VIDEOS } from "./presetVideos";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -126,6 +127,15 @@ interface CaptionTrackInfo {
 interface YouTubeSession {
   cookie: string;
   visitorData: string;
+  clientVersion: string;
+  sapisid?: string;
+  watchPageResult?: {
+    status?: string;
+    reason?: string;
+    title?: string;
+    aspectRatio?: number;
+    tracks: CaptionTrackInfo[];
+  };
 }
 
 const INNERTUBE_CLIENTS = [
@@ -204,18 +214,131 @@ const INNERTUBE_CLIENTS = [
 ];
 
 /**
- * 获取 YouTube 访客会话（Cookie 与 VISITOR_DATA），用于绕过匿名 Player 接口的 Bot 校验
+ * 获取用户可选配置的本地 Cookie（如项目根目录下的 cookies.txt 或 cookie.txt）
+ * 注意：仅过滤提取 youtube.com / .youtube.com 域名下的 Cookie，避免全量浏览器 Cookie 导致请求头超过大小限制 (HTTP 413/431)
+ */
+function loadCustomYouTubeCookies(): {
+  cookieString: string;
+  sapisid?: string;
+} {
+  const txtPaths = [
+    path.join(process.cwd(), "cookie.txt"),
+    path.join(process.cwd(), "cookies.txt"),
+  ];
+  for (const p of txtPaths) {
+    if (fs.existsSync(p)) {
+      try {
+        const raw = fs.readFileSync(p, "utf-8").trim();
+        if (!raw) continue;
+
+        const cookieMap = new Map<string, string>();
+
+        // 情况 1：直接粘贴的 Header Cookie 字符串（如 "VISITOR_INFO1_LIVE=...; SID=..."）
+        if (!raw.includes("\t") && raw.includes("=")) {
+          for (const part of raw.replace(/\r?\n/g, ";").split(";")) {
+            const eqIdx = part.indexOf("=");
+            if (eqIdx > 0) {
+              const k = part.slice(0, eqIdx).trim();
+              const v = part.slice(eqIdx + 1).trim();
+              if (k) cookieMap.set(k, v);
+            }
+          }
+        } else {
+          // 情况 2：Netscape 格式 cookies.txt（严格过滤 youtube.com 域名）
+          for (const line of raw.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) continue;
+            const cols = trimmed.split("\t");
+            if (cols.length >= 7) {
+              const domain = cols[0].toLowerCase();
+              if (
+                domain === "youtube.com" ||
+                domain.endsWith(".youtube.com")
+              ) {
+                cookieMap.set(cols[5], cols[6]);
+              }
+            }
+          }
+        }
+
+        if (cookieMap.size > 0) {
+          const cookieString = Array.from(cookieMap.entries())
+            .map(([k, v]) => `${k}=${v}`)
+            .join("; ");
+          const sapisid =
+            cookieMap.get("SAPISID") ||
+            cookieMap.get("__Secure-3PAPISID") ||
+            cookieMap.get("__Secure-1PAPISID");
+          return { cookieString, sapisid };
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return { cookieString: "" };
+}
+
+/**
+ * 生成带登录态 Cookie 时的 SAPISIDHASH Authorization 请求头
+ */
+function buildSapisidAuthorizationHeader(
+  sapisid: string,
+  origin = "https://www.youtube.com"
+): string {
+  const ts = Math.floor(Date.now() / 1000);
+  const hash = crypto
+    .createHash("sha1")
+    .update(`${ts} ${sapisid} ${origin}`)
+    .digest("hex");
+  return `SAPISIDHASH ${ts}_${hash} SAPISID1PHASH ${ts}_${hash} SAPISID3PHASH ${ts}_${hash}`;
+}
+
+/**
+ * 从 Watch 页面 HTML 中安全提取 ytInitialPlayerResponse 对象
+ */
+function extractInitialPlayerResponseFromHtml(html: string): Record<string, unknown> | null {
+  const marker = "ytInitialPlayerResponse = ";
+  const idx = html.indexOf(marker);
+  if (idx === -1) return null;
+  const startObj = idx + marker.length;
+  const endIdx = html.indexOf("};", startObj);
+  if (endIdx === -1) return null;
+  try {
+    return JSON.parse(html.slice(startObj, endIdx + 1));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 获取 YouTube 访客会话（Cookie 与 VISITOR_DATA）
  */
 async function fetchYouTubeSession(videoId: string): Promise<YouTubeSession> {
+  const { cookieString: customCookie, sapisid } = loadCustomYouTubeCookies();
+
+  // 如果用户已配置含登录凭证 (SAPISID) 的 cookies.txt，无需先抓取 2.7MB 的 Watch 页面（且 Watch 页面的字幕链接含 exp=xpe 会返回 0 字节空响应），直接构造鉴权会话即可
+  if (customCookie && sapisid) {
+    return {
+      cookie: customCookie,
+      visitorData: "",
+      clientVersion: "2.20261118.01.00",
+      sapisid,
+    };
+  }
+
+  const baseCookie = customCookie
+    ? customCookie
+    : "SOCS=CAI; PREF=hl=en&tz=UTC";
   const webUa =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
   try {
     const pageRes = await fetch(
-      `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`,
+      `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1&hl=en`,
       {
         headers: {
           "User-Agent": webUa,
-          Cookie: "SOCS=CAI; PREF=hl=en&tz=UTC",
+          Cookie: baseCookie,
           "Accept-Language": "en-US,en;q=0.9",
         },
         signal: AbortSignal.timeout(8000),
@@ -228,21 +351,34 @@ async function fetchYouTubeSession(videoId: string): Promise<YouTubeSession> {
           .map((c) => c.split(";")[0])
           .join("; ")
       : "";
-    const cookie = ["SOCS=CAI", "PREF=hl=en&tz=UTC", setCookies]
-      .filter(Boolean)
-      .join("; ");
+    const cookie = customCookie
+      ? customCookie
+      : [baseCookie, setCookies].filter(Boolean).join("; ");
     const html = await pageRes.text();
     const visitorData =
       html.match(/"VISITOR_DATA"\s*:\s*"([^"]+)"/)?.[1] || "";
+    const clientVersion =
+      html.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/)?.[1] ||
+      "2.20261118.01.00";
 
-    return { cookie, visitorData };
+    return {
+      cookie,
+      visitorData,
+      clientVersion,
+      sapisid,
+    };
   } catch {
-    return { cookie: "SOCS=CAI; PREF=hl=en&tz=UTC", visitorData: "" };
+    return {
+      cookie: baseCookie,
+      visitorData: "",
+      clientVersion: "2.20261118.01.00",
+      sapisid,
+    };
   }
 }
 
 /**
- * 通过多客户端轮询提取字幕轨道列表
+ * 通过多客户端轮询提取字幕轨道列表，并精确记录失败原因
  */
 async function fetchCaptionTracks(videoId: string): Promise<{
   title?: string;
@@ -250,13 +386,51 @@ async function fetchCaptionTracks(videoId: string): Promise<{
   tracks: CaptionTrackInfo[];
   cookie: string;
   userAgent: string;
+  failureReason?: "BOT_BLOCKED" | "VIDEO_UNAVAILABLE" | "NETWORK_ERROR";
+  failureDetail?: string;
 }> {
-  // 最多尝试 2 轮会话（如果第 1 个 visitorData 会话偶然被风控，刷新一次会话重试）
+  const webUa =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+  let sawBotBlock = false;
+  let sawUnavailable = false;
+  let lastReason = "";
+  let anyResponseReceived = false;
+
   for (let attempt = 0; attempt < 2; attempt++) {
     const session = await fetchYouTubeSession(videoId);
 
-    for (const c of INNERTUBE_CLIENTS) {
+    // 如果配置了登录态 Cookie (存在 SAPISID)，优先使用支持 Cookie 鉴权的 WEB 客户端请求 /youtubei/v1/player（生成的字幕 URL 不含 exp=xpe，可直接下载）
+    const clientsToTry = [
+      ...(session.sapisid
+        ? [
+            {
+              name: "WEB_AUTHED",
+              clientId: "1",
+              ua: webUa,
+              useAuthHeader: true,
+              client: {
+                clientName: "WEB",
+                clientVersion: session.clientVersion,
+                hl: "en",
+                gl: "US",
+              },
+            },
+          ]
+        : []),
+      ...INNERTUBE_CLIENTS.map((c) => ({ ...c, useAuthHeader: false })),
+    ];
+
+    for (const c of clientsToTry) {
       try {
+        const authHeaders: Record<string, string> = {};
+        if (c.useAuthHeader && session.sapisid) {
+          authHeaders["Authorization"] = buildSapisidAuthorizationHeader(
+            session.sapisid
+          );
+          authHeaders["X-Origin"] = "https://www.youtube.com";
+          authHeaders["X-Youtube-Bootstrap-Logged-In"] = "true";
+        }
+
         const res = await fetch(
           "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
           {
@@ -271,6 +445,7 @@ async function fetchCaptionTracks(videoId: string): Promise<{
                 : {}),
               ...(session.cookie ? { Cookie: session.cookie } : {}),
               Origin: "https://www.youtube.com",
+              ...authHeaders,
             },
             body: JSON.stringify({
               context: {
@@ -290,8 +465,10 @@ async function fetchCaptionTracks(videoId: string): Promise<{
         );
 
         if (!res.ok) continue;
+        anyResponseReceived = true;
         const data = await res.json();
         const status = data?.playabilityStatus?.status;
+        const reason = data?.playabilityStatus?.reason || "";
 
         if (status === "OK") {
           const tracks: CaptionTrackInfo[] =
@@ -315,6 +492,18 @@ async function fetchCaptionTracks(videoId: string): Promise<{
             userAgent: c.ua,
           };
         }
+
+        if (
+          status === "LOGIN_REQUIRED" ||
+          reason.toLowerCase().includes("not a bot") ||
+          reason.toLowerCase().includes("sign in")
+        ) {
+          sawBotBlock = true;
+          lastReason = reason || "Sign in to confirm you’re not a bot";
+        } else if (status === "UNPLAYABLE" || status === "ERROR") {
+          sawUnavailable = true;
+          lastReason = reason || status;
+        }
       } catch {
         // try next client
       }
@@ -325,6 +514,14 @@ async function fetchCaptionTracks(videoId: string): Promise<{
     tracks: [],
     cookie: "SOCS=CAI; PREF=hl=en&tz=UTC",
     userAgent: INNERTUBE_CLIENTS[0].ua,
+    failureReason: sawBotBlock
+      ? "BOT_BLOCKED"
+      : sawUnavailable
+      ? "VIDEO_UNAVAILABLE"
+      : !anyResponseReceived
+      ? "NETWORK_ERROR"
+      : undefined,
+    failureDetail: lastReason,
   };
 }
 
@@ -351,9 +548,12 @@ function decodeHtmlEntities(text: string): string {
  * 下载并解析单个字幕轨（支持 json3 与 XML 格式）
  */
 async function downloadTrackSubtitles(
-  baseUrl: string,
+  rawBaseUrl: string,
   headers: { cookie?: string; userAgent?: string } = {}
 ): Promise<SubtitleItem[]> {
+  const baseUrl = rawBaseUrl.startsWith("/")
+    ? `https://www.youtube.com${rawBaseUrl}`
+    : rawBaseUrl;
   const reqHeaders: Record<string, string> = {};
   if (headers.userAgent) reqHeaders["User-Agent"] = headers.userAgent;
   if (headers.cookie) reqHeaders["Cookie"] = headers.cookie;
@@ -448,44 +648,46 @@ function normalizeSubtitleTimings(
 
 /**
  * 智能选择视频原声字幕轨道：
- * YouTube 返回的 captionTracks 默认按语言名称字母序排列（例如 Arabic 'ar' 会排在 English 'en' 前面）。
- * 因此需要通过 ASR（自动语音识别）轨道语言或优先匹配原声语言（en / zh）来选出真正的原声字幕。
+ * 兼容普通多语种字幕与 YouTube 自动配音（Auto-dubbed 多 ASR 轨道）场景
  */
 function selectPrimaryTrack(tracks: CaptionTrackInfo[]): CaptionTrackInfo {
-  // 1. ASR 自动语音识别轨道的语言一定等于视频原本的说话语言
-  const asrTrack = tracks.find((t) => t.kind === "asr");
   const manualTracks = tracks.filter((t) => t.kind !== "asr");
+  const asrTracks = tracks.filter((t) => t.kind === "asr");
 
-  if (asrTrack && asrTrack.languageCode) {
-    const baseLang = asrTrack.languageCode.split("-")[0].toLowerCase();
-    // 优先寻找与原声语言一致的人工上传字幕
+  // 1. 如果视频只有唯一一条人工字幕（例如 7XzjQa8z0uc 有 1 条 'en' 人工字幕 + 21 条自动配音 ASR 字幕），该人工字幕必为原声字幕
+  if (manualTracks.length === 1) {
+    return manualTracks[0];
+  }
+
+  // 2. 如果只有唯一一条 ASR 语音识别轨道，则它的语言必为原声语言
+  if (asrTracks.length === 1 && asrTracks[0].languageCode) {
+    const baseLang = asrTracks[0].languageCode.split("-")[0].toLowerCase();
     const matchingManual =
       manualTracks.find(
-        (t) => t.languageCode.toLowerCase() === asrTrack.languageCode.toLowerCase()
+        (t) =>
+          t.languageCode.toLowerCase() ===
+          asrTracks[0].languageCode.toLowerCase()
       ) ||
       manualTracks.find(
         (t) => t.languageCode.split("-")[0].toLowerCase() === baseLang
       );
 
-    if (matchingManual) {
-      return matchingManual;
-    }
-    // 若该视频只有其他国家的翻译字幕和原声 ASR 字幕，优先使用原声 ASR 字幕
-    return asrTrack;
+    if (matchingManual) return matchingManual;
+    return asrTracks[0];
   }
 
-  // 2. 若没有 ASR 轨道，在人工字幕中优先匹配英文 (en*) 或中文 (zh*)
-  const enManual = manualTracks.find((t) =>
+  // 3. 在人工字幕池（若有）或 ASR 字幕池中，优先选择英语 (en*) 或中文 (zh*)
+  const pool = manualTracks.length > 0 ? manualTracks : asrTracks;
+
+  const enTrack = pool.find((t) =>
     t.languageCode.toLowerCase().startsWith("en")
   );
-  if (enManual) return enManual;
+  if (enTrack) return enTrack;
 
-  const zhManual = manualTracks.find((t) =>
-    isChineseLanguage(t.languageCode)
-  );
-  if (zhManual) return zhManual;
+  const zhTrack = pool.find((t) => isChineseLanguage(t.languageCode));
+  if (zhTrack) return zhTrack;
 
-  return manualTracks[0] || tracks[0];
+  return pool[0] || tracks[0];
 }
 
 /**
@@ -676,6 +878,15 @@ export async function getOrParseVideoData(
 
   const tracks = captionData.tracks;
   if (!tracks || tracks.length === 0) {
+    if (captionData.failureReason === "BOT_BLOCKED") {
+      throw new Error("BOT_BLOCKED");
+    }
+    if (captionData.failureReason === "NETWORK_ERROR") {
+      throw new Error("NETWORK_ERROR");
+    }
+    if (captionData.failureReason === "VIDEO_UNAVAILABLE") {
+      throw new Error("VIDEO_UNAVAILABLE");
+    }
     throw new Error("NO_SUBTITLES");
   }
 
